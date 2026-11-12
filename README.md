@@ -1,7 +1,7 @@
 # Photo geolocator
 
-This entry reads the supplied trial brief and the environment service's photo list, then sends each unanswered JPEG to Claude Sonnet 5.5 through the Anthropic Messages gateway. The visual-analysis prompt asks the model to describe visible clues, weigh alternatives, and narrow its estimate from country to the most specific defensible location.
+This entry loads task-specific instructions from MAKEFUN_PROMPT_FILE, retrieves the pending photos, and asks Claude to estimate where each image was taken. It submits the resulting coordinates together, in the same order as the photos, rounded to six decimal places.
 
-Photos are handled sequentially in listing order. Valid coordinates are range-checked and rounded to six decimal places, then submitted together in one ordered batch. If the first response has no parseable coordinate, the runner makes one text-only rescue request based on that response. The rescue includes at most 6,000 characters, retaining both its beginning and conclusion when the reply is longer.
+The location estimate is based on visible evidence such as terrain, buildings, vegetation, roads, signs, and language. If the model's first response does not contain a valid coordinate object, the entry makes one short text-only request to restate its conclusion in the required format.
 
-Only transient HTTP statuses (408, 429, and 5xx) are retried, with a fixed backoff. Connection errors, refusals, other HTTP failures, and unparseable responses do not trigger repeated model calls. Each call allows up to four attempts; each photo uses at most one analysis call and one rescue call, keeping the 25-photo run within the 200-request cap.
+Up to four photos are processed at once. Temporary service failures receive a small fixed retry schedule; invalid requests and other client errors are reported as failures. Run with Node 22 using node /bot/main.ts after setting the environment URL, Anthropic endpoint and key, and prompt file.

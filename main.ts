@@ -1,247 +1,182 @@
-/*
- * Photo geolocation runner.
- * Work through the service's listing in order and submit the coordinates that
- * can be supported by the model's visual evidence.
- */
-const MODEL = 'claude-sonnet-5-5';
-const ANALYSIS_TOKENS = 3072;
-const RESCUE_TOKENS = 256;
-const TRANSIENT_RETRIES = 3;
-const RETRY_DELAYS_MS = [1000, 2000, 4000];
+import { readFile } from "node:fs/promises";
 
-const ANALYST_INSTRUCTIONS = [
-  'Act as a careful visual geolocation analyst. Base the estimate on evidence visible in the image, not on a guessed landmark.',
-  'Describe clues before drawing conclusions: readable language, scripts, business names, signs and URL formats; driving side, road markings, signs, vehicle styles and plate shapes; architecture, materials, street furniture, poles and wiring; vegetation, climate, terrain and likely season.',
-  'Treat sun and shadow direction as weak evidence. Note flags, emblems, and distinctive public features when visible.',
-  'Separate direct observations from hypotheses and consider plausible alternatives. Narrow from country to region to city, then give the most specific defensible location. Do not claim unsupported precision; give one best point estimate even when evidence supports only a broad region.',
-  'Think through the evidence, then finish with exactly one JSON object containing numeric decimal-degree coordinates, in this form: {"lat": 0.0, "lon": 0.0}. Put no text after that object.'
-].join(' ');
+type Photo = {
+  id?: string | number;
+  photo_id?: string | number;
+  url?: string;
+  image_url?: string;
+  jpeg_url?: string;
+  answered?: boolean;
+  answer?: unknown;
+  lat?: number;
+  lon?: number;
+  [key: string]: unknown;
+};
 
-interface Photo {
-  id: string;
-  url: string;
-  answered: boolean;
+type Coordinate = { lat: number; lon: number };
+type Result = { id: string | number; lat: number; lon: number };
+
+const retryDelays = [250, 750, 1500];
+const promptPath = process.env.MAKEFUN_PROMPT_FILE;
+const envUrl = process.env.MAKEFUN_ENV_URL;
+const apiRoot = process.env.ANTHROPIC_BASE_URL;
+const apiKey = process.env.ANTHROPIC_API_KEY;
+
+if (!promptPath || !envUrl || !apiRoot || !apiKey) {
+  console.error("Required environment is missing.");
+  process.exit(1);
 }
 
-interface CoordinateAnswer {
-  id: string;
-  lat: number;
-  lon: number;
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+async function request(url: string, init: RequestInit = {}): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    try {
+      const response = await fetch(url, init);
+      if (!response.ok && (response.status === 408 || response.status === 429 || response.status >= 500) && attempt < retryDelays.length) {
+        await wait(retryDelays[attempt]);
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retryDelays.length) throw error;
+      await wait(retryDelays[attempt]);
+    }
+  }
+  throw lastError;
 }
 
-interface Coordinates {
-  lat: number;
-  lon: number;
+function responsePhotos(value: unknown): Photo[] {
+  if (Array.isArray(value)) return value as Photo[];
+  if (value && typeof value === "object") {
+    const row = value as Record<string, unknown>;
+    if (Array.isArray(row.photos)) return row.photos as Photo[];
+    if (Array.isArray(row.data)) return row.data as Photo[];
+  }
+  throw new Error("Photo endpoint returned no photo list.");
 }
 
-function env(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(name + ' is not set');
+function isAnswered(photo: Photo): boolean {
+  return photo.answered === true || photo.answer != null ||
+    (typeof photo.lat === "number" && typeof photo.lon === "number");
+}
+
+function photoId(photo: Photo): string | number {
+  const id = photo.photo_id ?? photo.id;
+  if (typeof id !== "string" && typeof id !== "number") throw new Error("Photo has no identifier.");
+  return id;
+}
+
+function imageUrl(photo: Photo): string {
+  const value = photo.jpeg_url ?? photo.image_url ?? photo.url;
+  if (typeof value !== "string") throw new Error("Photo has no JPEG URL.");
   return value;
 }
 
-function inLatitudeRange(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= -90 && value <= 90;
-}
-
-function inLongitudeRange(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= -180 && value <= 180;
-}
-
-function roundCoordinate(value: number): number {
-  return Math.round(value * 1_000_000) / 1_000_000;
-}
-
-function coordinatesFrom(value: Record<string, unknown>): Coordinates | null {
-  const latitude = value.lat ?? value.latitude ?? value.Lat ?? value.Latitude;
-  const longitude = value.lon ?? value.lng ?? value.longitude ?? value.Lon ?? value.Lng ?? value.Longitude;
-  if (!inLatitudeRange(latitude) || !inLongitudeRange(longitude)) return null;
-  return { lat: roundCoordinate(latitude), lon: roundCoordinate(longitude) };
-}
-
-function parseCoordinates(reply: string): Coordinates | null {
-  const found: Coordinates[] = [];
-  for (const part of reply.matchAll(/\{[^{}]*\}/gs)) {
+function parseCoordinates(text: string): Coordinate | null {
+  const candidates = [...text.matchAll(/\{[^{}]*\}/g)];
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
     try {
-      const value: unknown = JSON.parse(part[0]);
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        const coordinates = coordinatesFrom(value as Record<string, unknown>);
-        if (coordinates) found.push(coordinates);
-      }
+      const object = JSON.parse(candidates[index][0]) as Record<string, unknown>;
+      const latitude = object.lat ?? object.latitude ?? object.lat_deg;
+      const longitude = object.lon ?? object.lng ?? object.longitude ?? object.lon_deg;
+      if (typeof latitude !== "number" || typeof longitude !== "number") continue;
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+          latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) continue;
+      return { lat: latitude, lon: longitude };
     } catch {
-      // An explanatory brace group need not be JSON; keep looking for a verdict.
-    }
-  }
-  if (found.length > 0) return found[found.length - 1];
-
-  // Also accept a plain key/value coordinate pair embedded in prose.
-  const latitude = reply.match(/"?\b(?:lat|latitude)\b"?\s*[:=]\s*(-?\d+(?:\.\d+)?)/i);
-  const longitude = reply.match(/"?\b(?:lon|lng|longitude)\b"?\s*[:=]\s*(-?\d+(?:\.\d+)?)/i);
-  if (latitude && longitude) {
-    const coordinates = coordinatesFrom({
-      lat: Number(latitude[1]),
-      lon: Number(longitude[1])
-    });
-    if (coordinates) return coordinates;
-  }
-
-  // Last resort: inspect adjacent numeric pairs from the end of the response.
-  const numbers = Array.from(reply.matchAll(/-?\d+(?:\.\d+)?/g), (match) => Number(match[0]));
-  for (let index = numbers.length - 2; index >= 0; index--) {
-    const lat = numbers[index];
-    const lon = numbers[index + 1];
-    if (inLatitudeRange(lat) && inLongitudeRange(lon)) {
-      return { lat: roundCoordinate(lat), lon: roundCoordinate(lon) };
+      continue;
     }
   }
   return null;
 }
 
-async function getOk(url: string): Promise<Response> {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error('HTTP ' + response.status + ' from ' + url);
-  return response;
+function assistantText(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const content = (value as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((part) => part && typeof part === "object" && (part as Record<string, unknown>).type === "text")
+    .map((part) => String((part as Record<string, unknown>).text ?? "")).join("\n");
 }
 
-function isTransient(status: number): boolean {
-  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+function clip(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const side = Math.floor((limit - 32) / 2);
+  return text.slice(0, side) + "\n[... middle omitted ...]\n" + text.slice(-side);
 }
 
-async function requestText(body: string, gateway: string, apiKey: string): Promise<string | null> {
-  for (let retry = 0; ; retry++) {
-    let response: Response;
-    try {
-      response = await fetch(gateway + '/v1/messages', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01'
-        },
-        body
-      });
-    } catch (error) {
-      process.stderr.write('model request failed: ' + String(error).slice(0, 160) + '\n');
-      return null;
-    }
-
-    if (response.ok) {
-      try {
-        const payload = await response.json() as { content?: unknown };
-        if (!Array.isArray(payload.content)) return null;
-        return payload.content
-          .filter((block): block is { type: string; text?: string } =>
-            !!block && typeof block === 'object' && 'type' in block && typeof block.type === 'string')
-          .filter((block) => block.type === 'text')
-          .map((block) => typeof block.text === 'string' ? block.text : '')
-          .join('\n');
-      } catch {
-        return null;
-      }
-    }
-
-    const detail = (await response.text()).slice(0, 180).replace(/\s+/g, ' ');
-    if (isTransient(response.status) && retry < TRANSIENT_RETRIES) {
-      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[retry]));
-      continue;
-    }
-    process.stderr.write('model call HTTP ' + response.status + ': ' + detail + '\n');
-    return null;
-  }
-}
-
-function modelBody(imageBase64: string, tokenLimit: number): string {
-  return JSON.stringify({
-    model: MODEL,
-    max_tokens: tokenLimit,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
-        { type: 'text', text: ANALYST_INSTRUCTIONS }
-      ]
-    }]
+async function anthropic(body: Record<string, unknown>, token: number): Promise<string> {
+  const response = await request(new URL("/v1/messages", apiRoot).toString(), {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({ model: "claude-sonnet-5-5", max_tokens: token, ...body }),
   });
+  if (!response.ok) throw new Error("Anthropic request failed with HTTP " + response.status);
+  return assistantText(await response.json());
 }
 
-function rescueBody(previousReply: string): string {
-  const limit = 6000;
-  const context = previousReply.length <= limit ? previousReply : previousReply.slice(0, 3000) + '\n[...middle of reply omitted...]\n' + previousReply.slice(-3000);
-  return JSON.stringify({
-    model: MODEL,
-    max_tokens: RESCUE_TOKENS,
-    messages: [{
-      role: 'user',
-      content: 'Restate the conclusion from the reply below as exactly one JSON object with numeric decimal-degree coordinates: {"lat": ..., "lon": ...}. Use only the prior conclusion; do not invent another location.\n\n' + context
-    }]
-  });
+async function locate(photo: Photo, taskPrompt: string): Promise<Result> {
+  const imageResponse = await request(new URL(imageUrl(photo), envUrl).toString());
+  if (!imageResponse.ok) throw new Error("Photo download failed with HTTP " + imageResponse.status);
+  const bytes = new Uint8Array(await imageResponse.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length)));
+  }
+  const encoded = btoa(binary);
+  const instruction = taskPrompt + "\n\nEstimate the most likely camera location from visible geographic evidence. Compare landforms, vegetation, architecture, road markings, signs, coastline, shadows, and any readable language. Separate direct observations from inference, consider plausible alternatives, and narrow the estimate using the strongest independent clues. Give a concise rationale, then make your final line exactly one JSON object with numeric latitude and longitude, for example {\"lat\": 12.345678, \"lon\": -98.765432}. Keep coordinates within valid latitude and longitude ranges.";
+  const first = await anthropic({
+    messages: [{ role: "user", content: [
+      { type: "text", text: instruction },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: encoded } },
+    ] }],
+  }, 3072);
+  let coordinate = parseCoordinates(first);
+  if (!coordinate) {
+    const followUp = await anthropic({
+      messages: [{ role: "user", content: "Restate your conclusion from this previous reply as exactly one JSON object with numeric lat and lon, no other text:\n\n" + clip(first, 6000) }],
+    }, 256);
+    coordinate = parseCoordinates(followUp);
+  }
+  if (!coordinate) throw new Error("Model did not return valid coordinates for photo " + String(photoId(photo)));
+  return { id: photoId(photo), lat: coordinate.lat, lon: coordinate.lon };
 }
 
-async function locate(photo: Photo, envUrl: string, gateway: string, apiKey: string): Promise<CoordinateAnswer | null> {
-  try {
-    const imageResponse = await getOk(envUrl + photo.url);
-    const imageData = Buffer.from(await imageResponse.arrayBuffer()).toString('base64');
-    const initialReply = await requestText(modelBody(imageData, ANALYSIS_TOKENS), gateway, apiKey);
-    if (initialReply === null) return null;
-
-    let coordinates = parseCoordinates(initialReply);
-    if (coordinates === null) {
-      // One deterministic rescue asks for formatting of the existing conclusion.
-      const rescueReply = await requestText(rescueBody(initialReply), gateway, apiKey);
-      coordinates = rescueReply === null ? null : parseCoordinates(rescueReply);
+async function main(): Promise<void> {
+  const taskPrompt = await readFile(promptPath as string, "utf8");
+  const photoResponse = await request(new URL("/photos", envUrl).toString());
+  if (!photoResponse.ok) throw new Error("Photo endpoint failed with HTTP " + photoResponse.status);
+  const photos = responsePhotos(await photoResponse.json()).filter((photo) => !isAnswered(photo));
+  const results: (Result | null)[] = new Array(photos.length).fill(null);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= photos.length) return;
+      results[index] = await locate(photos[index], taskPrompt);
     }
-
-    if (coordinates === null) {
-      process.stderr.write('no coordinates parsed for ' + photo.id + '\n');
-      return null;
-    }
-    return { id: photo.id, ...coordinates };
-  } catch (error) {
-    process.stderr.write('photo ' + photo.id + ' failed: ' + String(error).slice(0, 160) + '\n');
-    return null;
   }
-}
-
-async function run(): Promise<number> {
-  const envUrl = env('MAKEFUN_ENV_URL').replace(/\/+$/, '');
-  const promptFile = env('MAKEFUN_PROMPT_FILE');
-  const gateway = env('ANTHROPIC_BASE_URL').replace(/\/+$/, '');
-  const apiKey = env('ANTHROPIC_API_KEY');
-
-  // Read the supplied brief as required by the trial contract.
-  await (await import('node:fs/promises')).readFile(promptFile, 'utf8');
-
-  const listing = await (await getOk(envUrl + '/photos')).json() as { photos?: Photo[] };
-  if (!listing || !Array.isArray(listing.photos)) throw new Error('invalid /photos response');
-  const unanswered = listing.photos.filter((photo) =>
-    photo && typeof photo.id === 'string' && typeof photo.url === 'string' && !photo.answered);
-
-  const answers: CoordinateAnswer[] = [];
-  let failedModelCalls = 0;
-  for (const photo of unanswered) {
-    const answer = await locate(photo, envUrl, gateway, apiKey);
-    if (answer) answers.push(answer);
-    // A missing answer can be a photo problem or an exhausted/refused model call.
-    else failedModelCalls++;
-  }
-
-  if (answers.length === 0) return failedModelCalls > 0 ? 1 : 0;
-  const submission = await fetch(envUrl + '/answers', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ answers })
+  await Promise.all(Array.from({ length: Math.min(4, photos.length) }, () => worker()));
+  const answers = results.map((result) => {
+    if (!result) throw new Error("A photo result is missing.");
+    return { photo_id: result.id, lat: Number(result.lat.toFixed(6)), lon: Number(result.lon.toFixed(6)) };
   });
-  if (!submission.ok) {
-    process.stderr.write('answer submission HTTP ' + submission.status + ': ' +
-      (await submission.text()).slice(0, 180) + '\n');
-    return 1;
-  }
-  return 0;
+  const posted = await request(new URL("/answers", envUrl).toString(), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ answers }),
+  });
+  if (!posted.ok) throw new Error("Answer submission failed with HTTP " + posted.status);
 }
 
-try {
-  process.exitCode = await run();
-} catch (error) {
-  process.stderr.write('photo geolocator: ' + String(error).slice(0, 300) + '\n');
-  process.exitCode = 1;
-}
+main().then(() => {
+  process.exit(0);
+}).catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
+
+// Keep this entry directly runnable by the Node 22 TypeScript runtime.
